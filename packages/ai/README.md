@@ -1082,11 +1082,17 @@ omp auth-broker login anthropic    # login to a specific provider
 omp auth-broker login vllm         # store vLLM API key (or placeholder for local no-auth)
 omp auth-broker list               # list supported providers
 omp auth-broker logout             # interactive — pick a stored credential to remove
+omp auth-broker accounts           # list stored OAuth accounts and which is pinned
+omp auth-broker use anthropic      # pin which account a provider uses (pick "Auto" to clear)
 ```
 
 Credentials are saved to `agent.db` in the agent directory. `/login qianfan` opens the Qianfan console and stores the pasted API key.
 
 `login` supports OAuth providers (Anthropic, OpenAI Codex, GitHub Copilot, Gemini CLI, Antigravity) and API-key onboarding flows.
+
+When a provider has more than one OAuth account, requests are balanced across them (deterministic per session, weighted by remaining quota). To choose an account explicitly, pin it: `/session pin <account>` binds it for the current session only, `/session pin --always <account>` (or `omp auth-broker use <provider>`) stores a durable, cross-session pin, and "Auto" clears the pin at that scope.
+
+Selection precedence runs by explicitness, then by narrowness of scope: runtime/config override → explicit session pin → durable account pin → incidental session stickiness → quota-ranked balancing. A pin is a preference, not a lock — a blocked or removed pinned account still falls through to siblings, so a pinned-but-exhausted account never wedges a request.
 
 For the current API-key onboarding flows, the library covers Together, Moonshot, Qianfan, NVIDIA, NanoGPT, Novita, Hugging Face, Venice, Xiaomi, vLLM, LiteLLM, Cloudflare AI Gateway, Qwen Portal, and Ollama Cloud. Ollama remains the local runtime integration; set `OLLAMA_API_KEY` only when your local or self-hosted deployment enforces bearer auth.
 

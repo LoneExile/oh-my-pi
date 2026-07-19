@@ -41,7 +41,7 @@ import {
 } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
 import type { SessionOAuthAccountList } from "../../session/agent-session-types";
-import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
+import type { AccountPinScope, ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import type { SessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
@@ -1746,7 +1746,7 @@ export class SelectorController {
 		});
 	}
 
-	async showSessionPinSelector(): Promise<void> {
+	async showSessionPinSelector(scope: AccountPinScope = "session"): Promise<void> {
 		const session = this.ctx.session;
 		if (session.isStreaming) {
 			this.ctx.showStatus("Cannot pin an account while the session is streaming.");
@@ -1782,17 +1782,27 @@ export class SelectorController {
 			return;
 		}
 
+		const scopeLabel = scope === "always" ? "always" : "this session";
 		this.showSelector(done => {
 			const selector = new SessionAccountSelectorComponent(
 				providerName,
 				accounts,
-				account => {
+				scope,
+				choice => {
 					done();
-					if (!session.pinCurrentProviderOAuthAccount(account.credentialId)) {
-						this.ctx.showWarning(`${account.label} is no longer available to pin.`);
-						return;
+					if (choice === "auto") {
+						if (!session.clearCurrentProviderOAuthPin(scope)) {
+							this.ctx.showWarning(`Could not clear the ${providerName} pin for ${scopeLabel}.`);
+							return;
+						}
+						this.ctx.showStatus(`Cleared the ${providerName} pin for ${scopeLabel}.`);
+					} else {
+						if (!session.pinCurrentProviderOAuthAccount(choice.credentialId, scope)) {
+							this.ctx.showWarning(`${choice.label} is no longer available to pin.`);
+							return;
+						}
+						this.ctx.showStatus(`Pinned ${choice.label} for ${providerName} — ${scopeLabel}.`);
 					}
-					this.ctx.showStatus(`Pinned ${account.label} to this session for ${providerName}.`);
 					this.ctx.statusLine.invalidate();
 					this.ctx.ui.requestRender();
 				},

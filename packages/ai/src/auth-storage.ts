@@ -412,6 +412,19 @@ export interface AuthCredentialStore {
 	/** Drop all cache rows whose keys start with the supplied prefix. */
 	deleteCachePrefix?(prefix: string): void;
 	cleanExpiredCache(): void;
+	/**
+	 * Read the OAuth credential id the user pinned for `provider`, or `null`
+	 * when no pin is set. A pin is a durable, cross-session preference the
+	 * selector honours over hash/round-robin balancing and quota ranking.
+	 * Optional: stores that cannot persist a local preference (e.g. the
+	 * read-only broker client) omit it, so pinning is then a no-op.
+	 */
+	getPinnedCredentialId?(provider: string): number | null;
+	/**
+	 * Pin (or clear, when `credentialId` is `null`) the preferred OAuth
+	 * credential id for `provider`. Optional; see {@link getPinnedCredentialId}.
+	 */
+	setPinnedCredentialId?(provider: string, credentialId: number | null): void;
 	/** Non-expired block for one (credential, providerKey, scope) key, or undefined. */
 	getCredentialBlock?(credentialId: number, providerKey: string, blockScope: string): number | undefined;
 	/** Earliest time a shared-store block should be eligible for live-usage reconciliation. */
@@ -873,6 +886,15 @@ export interface OAuthAccountIdentity {
 export type OAuthAccessResolution = ({ ok: true } & OAuthAccess) | ({ ok: false } & OAuthAccessFailure);
 
 /**
+ * How long an OAuth account pin lasts.
+ *
+ * Selection precedence runs by explicitness, then by narrowness of scope, so an
+ * explicit `session` pin outranks an `always` pin for that one session, and both
+ * outrank incidental stickiness and quota-ranked balancing.
+ */
+export type AccountPinScope = "session" | "always";
+
+/**
  * Read-only identity of one stored OAuth account, in stable storage order.
  * Returned by {@link AuthStorage.listOAuthAccounts}; `position` (0-based) is the
  * selector accepted by {@link AuthStorage.getOAuthAccessAt}.
@@ -889,6 +911,10 @@ export interface OAuthAccountSummary {
 	orgName?: string;
 	/** True when this account is the session-sticky OAuth credential requested by `listOAuthAccounts`. */
 	active: boolean;
+	/** True when this account carries the durable, cross-session pin for the provider. */
+	pinned: boolean;
+	/** True when this session's `active` flag comes from a deliberate `/session pin`. */
+	sessionPinned: boolean;
 }
 export interface InvalidateCredentialMatchingOptions {
 	signal?: AbortSignal;
@@ -1237,10 +1263,13 @@ export class AuthStorage {
 	#configOverrides: Map<string, string> = new Map();
 	/** Tracks next credential index per provider:type key for round-robin distribution (non-session use). */
 	#providerRoundRobinIndex: Map<string, number> = new Map();
-	/** Tracks the last used credential per provider for a session (used for rate-limit switching). */
+	/**
+	 * Tracks the last used credential per provider for a session (used for rate-limit switching).
+	 * `explicit` distinguishes a deliberate `/session pin` from an incidental balancer landing.
+	 */
 	#sessionLastCredential: Map<
 		string,
-		Map<string, { type: AuthCredential["type"]; index: number; lastUsedAtMs?: number }>
+		Map<string, { type: AuthCredential["type"]; index: number; lastUsedAtMs?: number; explicit?: boolean }>
 	> = new Map();
 	/** Recent bearer fingerprints resolved for each durable OAuth row; used only for delayed usage-limit attribution. */
 	#oauthBearerFingerprints: Map<string, Map<number, string[]>> = new Map();
@@ -1781,24 +1810,34 @@ export class AuthStorage {
 		}
 	}
 
-	/** Records which credential was used for a session (for rate-limit switching). */
+	/**
+	 * Records which credential was used for a session (for rate-limit switching).
+	 *
+	 * `explicit` marks a deliberate user choice (`/session pin`) rather than an
+	 * incidental balancer landing. Selection ranks an explicit session pin above a
+	 * durable account pin, and a durable pin above incidental stickiness, so a
+	 * narrower deliberate choice is never silently overwritten by a broader one.
+	 */
 	#recordSessionCredential(
 		provider: string,
 		sessionId: string | undefined,
 		type: AuthCredential["type"],
 		index: number,
+		explicit = false,
 	): void {
 		if (!sessionId) return;
 		const nowMs = Date.now();
 		const sessionMap = this.#sessionLastCredential.get(provider) ?? new Map();
-		sessionMap.set(sessionId, { type, index, lastUsedAtMs: nowMs });
+		// An automatic landing must never downgrade a deliberate pin for this session.
+		if (!explicit && sessionMap.get(sessionId)?.explicit === true) return;
+		sessionMap.set(sessionId, { type, index, lastUsedAtMs: nowMs, explicit });
 		this.#sessionLastCredential.set(provider, sessionMap);
 
 		try {
 			const credentialId = this.#getStoredCredentials(provider)[index]?.id;
 			if (credentialId !== undefined) {
 				const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
-				const cacheValue = JSON.stringify({ type, index, credentialId, lastUsedAtMs: nowMs });
+				const cacheValue = JSON.stringify({ type, index, credentialId, lastUsedAtMs: nowMs, explicit });
 				// Expires in 30 days
 				const expiresAtSec = Math.floor(nowMs / 1000) + 30 * 24 * 60 * 60;
 				this.#store.setCache(cacheKey, cacheValue, expiresAtSec);
@@ -1812,7 +1851,7 @@ export class AuthStorage {
 	#getSessionCredential(
 		provider: string,
 		sessionId: string | undefined,
-	): { type: AuthCredential["type"]; index: number; lastUsedAtMs?: number } | undefined {
+	): { type: AuthCredential["type"]; index: number; lastUsedAtMs?: number; explicit?: boolean } | undefined {
 		if (!sessionId) return undefined;
 		let sessionMap = this.#sessionLastCredential.get(provider);
 		if (sessionMap?.has(sessionId)) {
@@ -1827,6 +1866,7 @@ export class AuthStorage {
 					index: number;
 					credentialId?: number;
 					lastUsedAtMs?: number;
+					explicit?: boolean;
 				};
 
 				if (val.credentialId !== undefined) {
@@ -1847,7 +1887,13 @@ export class AuthStorage {
 					sessionMap = new Map();
 					this.#sessionLastCredential.set(provider, sessionMap);
 				}
-				const sessionVal = { type: val.type, index: val.index, lastUsedAtMs: val.lastUsedAtMs };
+				const sessionVal = {
+					type: val.type,
+					index: val.index,
+					lastUsedAtMs: val.lastUsedAtMs,
+					// Rows written before explicit-pin tracking are incidental stickiness.
+					explicit: val.explicit === true,
+				};
 				sessionMap.set(sessionId, sessionVal);
 				return sessionVal;
 			}
@@ -2630,7 +2676,55 @@ export class AuthStorage {
 		// filtered array would be off-by-N when any non-OAuth credential precedes the
 		// OAuth ones (e.g. [api_key, oauth_A, oauth_B] stored order).
 		const stickyCredential = sessionPref?.type === "oauth" ? allCredentials[sessionPref.index] : undefined;
-		return stickyCredential?.type === "oauth" ? stickyCredential : oauthCredentials[0];
+		// Mirror the selection precedence in #resolveOAuthSelection so display and
+		// account_uuid attribution (e.g. the /usage active-account marker) name the
+		// account the selector will actually route to: an explicit session pin wins,
+		// then a durable account pin, then incidental stickiness.
+		if (stickyCredential?.type === "oauth" && sessionPref?.explicit === true) return stickyCredential;
+		const pinnedIndex = this.#resolvePinnedOAuthPosition(provider);
+		const pinnedCredential = pinnedIndex !== undefined ? allCredentials[pinnedIndex] : undefined;
+		if (pinnedCredential?.type === "oauth") return pinnedCredential;
+		if (stickyCredential?.type === "oauth") return stickyCredential;
+		return oauthCredentials[0];
+	}
+
+	/**
+	 * Resolve the pinned OAuth credential id for `provider` to its index in the
+	 * FULL, unfiltered stored-credential array, or `undefined` when no pin is
+	 * set, the backing store cannot persist pins, or the pinned row is gone / no
+	 * longer OAuth. Mirrors the session-sticky id→index resolution so a removed
+	 * or re-logged-in account gracefully drops the pin instead of breaking
+	 * selection. A pin is a durable, user-set preference; the selector honours it
+	 * over hash/round-robin balancing and quota ranking.
+	 */
+	#resolvePinnedOAuthPosition(provider: string): number | undefined {
+		const pinnedId = this.#store.getPinnedCredentialId?.(provider);
+		if (pinnedId == null) return undefined;
+		const stored = this.#getStoredCredentials(provider);
+		const index = stored.findIndex(entry => entry.id === pinnedId && entry.credential.type === "oauth");
+		return index === -1 ? undefined : index;
+	}
+
+	/** The OAuth credential id pinned for `provider`, or `undefined` when unset/unsupported. */
+	getPinnedCredentialId(provider: string): number | undefined {
+		const id = this.#store.getPinnedCredentialId?.(provider);
+		return id == null ? undefined : id;
+	}
+
+	/**
+	 * Pin `credentialId` as the preferred OAuth account for `provider`, or clear
+	 * the pin when `credentialId` is `null`. Returns `false` when the backing
+	 * store cannot persist pins, or when pinning an id that is not a stored OAuth
+	 * credential for the provider.
+	 */
+	setPinnedCredential(provider: string, credentialId: number | null): boolean {
+		if (!this.#store.setPinnedCredentialId) return false;
+		if (credentialId !== null) {
+			const entry = this.#getStoredCredentials(provider).find(candidate => candidate.id === credentialId);
+			if (entry?.credential.type !== "oauth") return false;
+		}
+		this.#store.setPinnedCredentialId(provider, credentialId);
+		return true;
 	}
 
 	/**
@@ -4486,7 +4580,27 @@ export class AuthStorage {
 		if (credentials.length === 0) return undefined;
 
 		const providerKey = this.#getProviderTypeKey(provider, "oauth");
-		const order = this.#getCredentialOrder(providerKey, sessionId, credentials.length);
+		let order = this.#getCredentialOrder(providerKey, sessionId, credentials.length);
+		// Account selection precedence, ordered by explicitness then by narrowness of
+		// scope: runtime/config override (handled by the caller) → explicit session
+		// pin (`/session pin`) → durable account pin (`/session pin --always`,
+		// `omp auth-broker use`) → incidental session stickiness → hash/round-robin
+		// balancing and quota ranking.
+		//
+		// The durable pin therefore stands down for this session when the user made a
+		// narrower, deliberate choice; otherwise it beats balancing AND quota ranking.
+		// It stays a preference, not a lock — a blocked or unusable pinned account
+		// still falls through to siblings, because it is only hoisted to the front of
+		// `order` (which wraps around) and the ranking bypass below is gated on the
+		// pin being usable. `accountPinIndex` is the full stored index (for block
+		// checks); `accountPinPos` is its position in the OAuth-filtered list.
+		const sessionPinIsExplicit = this.#getSessionCredential(provider, sessionId)?.explicit === true;
+		const accountPinIndex = sessionPinIsExplicit ? undefined : this.#resolvePinnedOAuthPosition(provider);
+		const accountPinPos =
+			accountPinIndex === undefined ? -1 : credentials.findIndex(entry => entry.index === accountPinIndex);
+		if (accountPinPos >= 0) {
+			order = [accountPinPos, ...order.filter(pos => pos !== accountPinPos)];
+		}
 		const strategy = this.#rankingStrategyResolver?.(provider);
 		const rankingContext: CredentialRankingContext = { modelId: options?.modelId };
 		const blockScope = strategy?.blockScope?.(rankingContext);
@@ -4519,7 +4633,20 @@ export class AuthStorage {
 			sessionPreferredIndex !== undefined &&
 			sessionPreferredCanRefreshOrUse &&
 			!this.#isCredentialBlocked(provider, providerKey, sessionPreferredIndex, blockScope);
-		const shouldRank = checkUsage && (!sessionPreferredIsAvailable || !sessionPreferredIsWarm || hasPlanRequirement);
+		// A pinned account is "usable" when its credential can refresh/serve and is
+		// not currently blocked; only then is quota ranking bypassed so the pin is
+		// honoured. A blocked/expired pin falls through to normal ranking/rotation.
+		const accountPinCredential = accountPinPos >= 0 ? credentials[accountPinPos]?.credential : undefined;
+		const accountPinUsable =
+			accountPinIndex !== undefined &&
+			accountPinCredential !== undefined &&
+			(accountPinCredential.refresh.trim().length > 0 ||
+				Date.now() + OAUTH_REFRESH_SKEW_MS < accountPinCredential.expires) &&
+			!this.#isCredentialBlocked(provider, providerKey, accountPinIndex, blockScope);
+		const shouldRank =
+			!accountPinUsable &&
+			checkUsage &&
+			(!sessionPreferredIsAvailable || !sessionPreferredIsWarm || hasPlanRequirement);
 		// When ranking, seed the pinned credential first in the evaluation order so it wins genuine
 		// ties (the ranked comparator falls back to `orderPos`) without overriding a strictly-better
 		// sibling — this respects the residual value of a same-account shared static prefix that other
@@ -4556,7 +4683,7 @@ export class AuthStorage {
 		// On the warm skip path the candidate list follows the round-robin `order`, not the pin, so
 		// hoist the pinned credential to the front to actually reuse it. When ranking ran, the pin is
 		// already a mere tie-break via `rankingOrder`; do not override the ranked result here.
-		if (!shouldRank && sessionPreferredIndex !== undefined && !hasPlanRequirement) {
+		if (!shouldRank && !accountPinUsable && sessionPreferredIndex !== undefined && !hasPlanRequirement) {
 			const sessionPreferredCandidate = candidates.findIndex(
 				candidate =>
 					!this.#isCredentialBlocked(provider, providerKey, candidate.selection.index, blockScope) &&
@@ -4650,7 +4777,7 @@ export class AuthStorage {
 		// unenforced and the pin is not known-ineligible) so an active session never
 		// silently migrates accounts mid-conversation; blocked, exhausted, or
 		// known-ineligible pins still fall through to the ranked sibling.
-		if (hasPlanRequirement && sessionPreferredIndex !== undefined) {
+		if (hasPlanRequirement && !accountPinUsable && sessionPreferredIndex !== undefined) {
 			const sessionPreferredCandidate = candidates.findIndex(
 				candidate =>
 					!this.#isCredentialBlocked(provider, providerKey, candidate.selection.index, blockScope) &&
@@ -5320,8 +5447,10 @@ export class AuthStorage {
 	 * account" UI should render `position + 1`.
 	 *
 	 * When `sessionId` is supplied, the session-sticky OAuth credential is marked
-	 * `active`. No account is active before that session has resolved or pinned a
-	 * credential.
+	 * `active`, and `sessionPinned` distinguishes a deliberate `/session pin` from
+	 * incidental stickiness. No account is active before that session has resolved
+	 * or pinned a credential. `pinned` marks the durable, cross-session pin and is
+	 * independent of `sessionId`.
 	 */
 	listOAuthAccounts(provider: string, sessionId?: string): OAuthAccountSummary[] {
 		if (this.#runtimeOverrides.has(provider) || this.#configOverrides.has(provider)) {
@@ -5332,6 +5461,8 @@ export class AuthStorage {
 			sessionCredential?.type === "oauth"
 				? this.#getStoredCredentials(provider)[sessionCredential.index]?.id
 				: undefined;
+		const pinnedCredentialId = this.#store.getPinnedCredentialId?.(provider) ?? undefined;
+		const sessionPinIsExplicit = sessionCredential?.explicit === true;
 		return this.#getStoredOAuthSelections(provider).map((selection, position) => ({
 			position,
 			credentialId: selection.credentialId,
@@ -5342,6 +5473,8 @@ export class AuthStorage {
 			orgId: selection.credential.orgId,
 			orgName: selection.credential.orgName,
 			active: selection.credentialId === activeCredentialId,
+			pinned: selection.credentialId === pinnedCredentialId,
+			sessionPinned: sessionPinIsExplicit && selection.credentialId === activeCredentialId,
 		}));
 	}
 
@@ -5351,6 +5484,9 @@ export class AuthStorage {
 	 * The durable credential id keeps the pin stable across credential refreshes,
 	 * storage reordering, and process restarts. Normal auth retry and usage-limit
 	 * handling may still route around an unavailable account.
+	 *
+	 * Recorded as an *explicit* choice, so it outranks a durable account pin for
+	 * this session — the narrower, deliberate selection wins.
 	 */
 	pinSessionOAuthAccount(provider: string, sessionId: string, credentialId: number): boolean {
 		if (!sessionId || this.#runtimeOverrides.has(provider) || this.#configOverrides.has(provider)) {
@@ -5360,8 +5496,24 @@ export class AuthStorage {
 		const index = stored.findIndex(entry => entry.id === credentialId);
 		const target = stored[index];
 		if (target?.credential.type !== "oauth") return false;
-		this.#recordSessionCredential(provider, sessionId, "oauth", index);
+		this.#recordSessionCredential(provider, sessionId, "oauth", index, true);
 		return true;
+	}
+
+	/**
+	 * Drop this session's explicit OAuth pin so selection falls back to the
+	 * durable account pin, or to balancing when no durable pin is set. Powers the
+	 * "Auto" row of the account picker at session scope.
+	 */
+	clearSessionOAuthPin(provider: string, sessionId: string): boolean {
+		if (!sessionId) return false;
+		this.#clearSessionCredential(provider, sessionId);
+		return true;
+	}
+
+	/** True when this session carries a deliberate `/session pin` for `provider`. */
+	hasExplicitSessionOAuthPin(provider: string, sessionId?: string): boolean {
+		return this.#getSessionCredential(provider, sessionId)?.explicit === true;
 	}
 
 	/**
@@ -6525,6 +6677,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#insertUsageHistoryStmt: Statement;
 	#insertUsageCostStmt: Statement;
 	#listUsageCostsStmt: Statement;
+	#getPinnedAccountStmt: Statement;
+	#upsertPinnedAccountStmt: Statement;
+	#deletePinnedAccountStmt: Statement;
 	#lastUsageHistoryStmt: Statement;
 	#listUsageHistoryStmt: Statement;
 	#updateUsageHistoryStmt: Statement;
@@ -6645,6 +6800,13 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#listUsageCostsStmt = this.#db.prepare(
 			"SELECT recorded_at, provider, account_key, cost_usd FROM usage_cost_history WHERE recorded_at >= ? AND (? IS NULL OR provider = ?) AND (? IS NULL OR account_key = ?) ORDER BY recorded_at ASC",
 		);
+		this.#getPinnedAccountStmt = this.#db.prepare(
+			"SELECT credential_id FROM auth_pinned_accounts WHERE provider = ?",
+		);
+		this.#upsertPinnedAccountStmt = this.#db.prepare(
+			`INSERT INTO auth_pinned_accounts (provider, credential_id, updated_at) VALUES (?, ?, ${SQLITE_NOW_EPOCH}) ON CONFLICT(provider) DO UPDATE SET credential_id = excluded.credential_id, updated_at = excluded.updated_at`,
+		);
+		this.#deletePinnedAccountStmt = this.#db.prepare("DELETE FROM auth_pinned_accounts WHERE provider = ?");
 	}
 
 	static async open(dbPath: string = getAgentDbPath()): Promise<SqliteAuthCredentialStore> {
@@ -6768,6 +6930,11 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			);
 			CREATE INDEX IF NOT EXISTS idx_client_usage_series ON client_usage(install_id, provider, model, recorded_at);
 			CREATE INDEX IF NOT EXISTS idx_client_usage_recorded ON client_usage(recorded_at);
+			CREATE TABLE IF NOT EXISTS auth_pinned_accounts (
+				provider TEXT PRIMARY KEY,
+				credential_id INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL
+			);
 		`);
 
 		if (!this.#authCredentialsTableExists()) {
@@ -7748,6 +7915,37 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.deleteAuthCredentialsForProvider(provider, "deleted by user");
 	}
 
+	/**
+	 * The OAuth credential id the user pinned for `provider`, or `null` when no
+	 * pin is set. Reads never throw: a failed read degrades to "no pin" so auth
+	 * resolution keeps working.
+	 */
+	getPinnedCredentialId(provider: string): number | null {
+		try {
+			const row = this.#getPinnedAccountStmt.get(provider) as { credential_id?: number } | undefined;
+			return typeof row?.credential_id === "number" ? row.credential_id : null;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * Pin `credentialId` as the preferred account for `provider`, or clear the pin
+	 * when `credentialId` is `null`. Best-effort: a failed write is swallowed so it
+	 * never breaks auth resolution (the pin simply does not take effect).
+	 */
+	setPinnedCredentialId(provider: string, credentialId: number | null): void {
+		try {
+			if (credentialId === null) {
+				this.#deletePinnedAccountStmt.run(provider);
+			} else {
+				this.#upsertPinnedAccountStmt.run(provider, credentialId);
+			}
+		} catch {
+			// Intentionally ignored — see doc comment.
+		}
+	}
+
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
@@ -7776,6 +7974,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#updateUsageHistoryStmt.finalize();
 		this.#insertUsageCostStmt.finalize();
 		this.#listUsageCostsStmt.finalize();
+		this.#getPinnedAccountStmt.finalize();
+		this.#upsertPinnedAccountStmt.finalize();
+		this.#deletePinnedAccountStmt.finalize();
 		this.#db.close();
 	}
 }

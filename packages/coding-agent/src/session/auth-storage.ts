@@ -4,6 +4,7 @@
  */
 
 export type {
+	AccountPinScope,
 	ApiKeyCredential,
 	AuthCredential,
 	AuthCredentialEntry,

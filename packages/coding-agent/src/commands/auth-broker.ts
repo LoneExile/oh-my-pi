@@ -19,9 +19,9 @@ export default class AuthBroker extends Command {
 			required: false,
 			options: [...AUTH_BROKER_ACTIONS],
 		}),
-		// Second positional: provider id (login/logout) or filesystem path (import).
+		// Second positional: provider id (login/logout/accounts/use) or filesystem path (import).
 		source: Args.string({
-			description: "OAuth provider id (login/logout) or path (import)",
+			description: "OAuth provider id (login/logout/accounts/use) or path (import)",
 			required: false,
 		}),
 	};
@@ -66,6 +66,8 @@ export default class AuthBroker extends Command {
 		"# Preview a migration from local store + env vars to the configured broker\n  omp auth-broker migrate --from-local --include-env --dry-run",
 		"# Apply the migration\n  omp auth-broker migrate --from-local --include-env",
 		"# Health-check the configured remote broker\n  omp auth-broker status",
+		"# List stored OAuth accounts and which is pinned\n  omp auth-broker accounts",
+		"# Pin which account a provider uses (interactive; pick 'Auto' to clear)\n  omp auth-broker use anthropic",
 	];
 
 	async run(): Promise<void> {

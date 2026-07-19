@@ -53,7 +53,7 @@ import { createMarketplaceManager } from "./helpers/marketplace-manager";
 import { handleMcpAcp } from "./helpers/mcp";
 import { commandConsumed, errorMessage, parseSlashCommand, parseSubcommand, usage } from "./helpers/parse";
 import { describeRedeemOutcome, type ResetUsageAccount, toResetUsageAccounts } from "./helpers/reset-usage";
-import { matchSessionPinAccounts, toSessionPinAccounts } from "./helpers/session-pin";
+import { matchSessionPinAccounts, parsePinArgs, toSessionPinAccounts } from "./helpers/session-pin";
 import { handleSshAcp } from "./helpers/ssh";
 import { launchStatsDashboard, parseStatsDashboardArgs } from "./helpers/stats-dashboard";
 import { handleTodoAcp } from "./helpers/todo";
@@ -254,14 +254,35 @@ async function handleSessionPinCommand(
 		return;
 	}
 
-	const selector = arg.trim();
+	const { scope, selector } = parsePinArgs(arg);
+	const scopeLabel = scope === "always" ? "always" : "this session";
 	if (!selector) {
 		const lines = [`OAuth accounts for ${providerName}:`];
 		for (const account of accounts) {
-			lines.push(`${account.position + 1}. ${account.label}${account.active ? " (active)" : ""}`);
+			const notes: string[] = [];
+			if (account.sessionPinned) notes.push("pinned this session");
+			else if (account.active) notes.push("active");
+			if (account.pinned) notes.push("pinned always");
+			lines.push(`${account.position + 1}. ${account.label}${notes.length ? ` (${notes.join(", ")})` : ""}`);
 		}
-		lines.push("", "Pin one with `/session pin <number|email|account id>`.");
+		lines.push(
+			"",
+			"Pin for this session with `/session pin <number|email|account id>`,",
+			"across sessions with `/session pin --always <number|email|account id>`,",
+			"or clear it with `/session pin auto` / `/session pin --always auto`.",
+		);
 		await output(lines.join("\n"));
+		return;
+	}
+
+	if (selector === "auto") {
+		if (!session.clearCurrentProviderOAuthPin(scope)) {
+			await output(`Could not clear the ${providerName} pin for ${scopeLabel}.`);
+			return;
+		}
+		await output(
+			`Cleared the ${providerName} pin for ${scopeLabel}; balancing across ${accounts.length} account(s).`,
+		);
 		return;
 	}
 
@@ -279,11 +300,11 @@ async function handleSessionPinCommand(
 		return;
 	}
 	const account = matches[0];
-	if (!account || !session.pinCurrentProviderOAuthAccount(account.credentialId)) {
+	if (!account || !session.pinCurrentProviderOAuthAccount(account.credentialId, scope)) {
 		await output(`${account?.label ?? selector} is no longer available to pin.`);
 		return;
 	}
-	await output(`Pinned ${account.label} to this session for ${providerName}.`);
+	await output(`Pinned ${account.label} for ${providerName} — ${scopeLabel}.`);
 }
 
 /** Parse the `/shake` subcommand into a {@link ShakeMode}; empty defaults to elide. */
@@ -1115,14 +1136,14 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		name: "session",
 		description: "Session management commands",
 		acpDescription: "Show or configure the current session",
-		acpInputHint: "[info|delete|pin [account]]",
+		acpInputHint: "[info|delete|pin [--always] [account|auto]]",
 		subcommands: [
 			{ name: "info", description: "Show session info and stats" },
 			{ name: "delete", description: "Delete current session and return to selector" },
 			{
 				name: "pin",
-				description: "Pin the current provider to a stored OAuth account",
-				usage: "[account]",
+				description: "Pin the current provider to a stored OAuth account (--always to persist)",
+				usage: "[--always] [account|auto]",
 			},
 		],
 		allowArgs: true,
@@ -1171,11 +1192,14 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return;
 			}
 			if (verb === "pin") {
-				if (rest) {
+				// A bare scope flag (`/session pin --always`) still opens the picker, at
+				// that scope; only a real selector takes the non-interactive path.
+				const { scope, selector } = parsePinArgs(rest);
+				if (selector) {
 					await handleSessionPinCommand(rest, runtime.ctx.session, text => runtime.ctx.showStatus(text));
 					refreshStatusLine(runtime.ctx);
 				} else {
-					await runtime.ctx.showSessionPinSelector();
+					await runtime.ctx.showSessionPinSelector(scope);
 				}
 				runtime.ctx.editor.setText("");
 				return;
@@ -1183,7 +1207,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			if (!verb || (verb === "info" && !rest)) {
 				await runtime.ctx.handleSessionCommand();
 			} else {
-				runtime.ctx.showStatus("Usage: /session [info|delete|pin [account]]");
+				runtime.ctx.showStatus("Usage: /session [info|delete|pin [--always] [account|auto]]");
 			}
 			runtime.ctx.editor.setText("");
 		},

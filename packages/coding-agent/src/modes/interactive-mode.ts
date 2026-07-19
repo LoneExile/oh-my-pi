@@ -102,6 +102,7 @@ import {
 	type ResolvedRoleModel,
 	SHUTDOWN_CONSOLIDATE_BUDGET_MS,
 } from "../session/agent-session";
+import type { AccountPinScope } from "../session/auth-storage";
 import type { CompactMode } from "../session/compact-modes";
 import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext } from "../session/session-context";
@@ -4694,8 +4695,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#selectorController.showOAuthSelector(mode, providerId);
 	}
 
-	showSessionPinSelector(): Promise<void> {
-		return this.#selectorController.showSessionPinSelector();
+	showSessionPinSelector(scope?: AccountPinScope): Promise<void> {
+		return this.#selectorController.showSessionPinSelector(scope);
 	}
 
 	showResetUsageSelector(): Promise<void> {

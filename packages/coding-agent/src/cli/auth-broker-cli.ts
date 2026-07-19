@@ -38,8 +38,19 @@ import { setTransports as setLoggerTransports } from "@oh-my-pi/pi-utils/logger"
 import { $ } from "bun";
 import chalk from "chalk";
 import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
+import { toSessionPinAccounts } from "../slash-commands/helpers/session-pin";
 
-export type AuthBrokerAction = "serve" | "token" | "login" | "logout" | "status" | "import" | "migrate" | "list";
+export type AuthBrokerAction =
+	| "serve"
+	| "token"
+	| "login"
+	| "logout"
+	| "status"
+	| "import"
+	| "migrate"
+	| "list"
+	| "accounts"
+	| "use";
 
 export interface AuthBrokerCommandArgs {
 	action: AuthBrokerAction;
@@ -72,6 +83,8 @@ const ACTIONS: readonly AuthBrokerAction[] = [
 	"migrate",
 	"status",
 	"list",
+	"accounts",
+	"use",
 ];
 
 /** Callback ports baked from the per-provider OAuth flow modules. */
@@ -417,6 +430,150 @@ async function runList(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	process.stdout.write("Available providers:\n\n");
 	for (const p of providers) {
 		process.stdout.write(`  ${p.id.padEnd(20)} ${p.name}\n`);
+	}
+}
+
+// ─── Account pin (durable, cross-session account selection) ────────────
+//
+// The CLI has no session, so `omp auth-broker use` always writes the durable
+// pin — the same one `/session pin --always` sets in the TUI.
+
+interface StoredOAuthAccount {
+	provider: string;
+	id: number;
+	label: string;
+	pinned: boolean;
+}
+
+/**
+ * Collect stored OAuth accounts for the given providers, flagging the durable
+ * pin. Labels come from the same helper the TUI picker uses, so an account reads
+ * identically in both surfaces.
+ */
+function collectOAuthAccounts(storage: AuthStorage, providers: string[]): StoredOAuthAccount[] {
+	const accounts: StoredOAuthAccount[] = [];
+	for (const provider of providers) {
+		for (const account of toSessionPinAccounts(storage.listOAuthAccounts(provider))) {
+			accounts.push({ provider, id: account.credentialId, label: account.label, pinned: account.pinned });
+		}
+	}
+	return accounts;
+}
+
+async function runAccounts(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
+	const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
+	try {
+		const storage = new AuthStorage(store);
+		await storage.reload();
+		const providers = flags.provider ? [flags.provider] : store.listProviders();
+		const accounts = collectOAuthAccounts(storage, providers);
+		if (flags.json) {
+			process.stdout.write(`${JSON.stringify(accounts)}\n`);
+			return;
+		}
+		if (accounts.length === 0) {
+			process.stdout.write("No OAuth accounts stored.\n");
+			return;
+		}
+		let currentProvider = "";
+		for (const account of accounts) {
+			if (account.provider !== currentProvider) {
+				currentProvider = account.provider;
+				process.stdout.write(`\n${chalk.bold(currentProvider)}\n`);
+			}
+			const marker = account.pinned ? chalk.green("● pinned") : chalk.dim("○ auto  ");
+			process.stdout.write(`  ${marker}  ${account.label}  ${chalk.dim(`#${account.id}`)}\n`);
+		}
+		process.stdout.write("\nPin one with: omp auth-broker use [provider]\n");
+	} finally {
+		store.close();
+	}
+}
+
+async function runUse(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
+	const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
+	try {
+		const storage = new AuthStorage(store);
+		await storage.reload();
+
+		let provider = flags.provider;
+		if (!provider) {
+			const withOAuth = store
+				.listProviders()
+				.filter(p => storage.listStoredCredentials(p).some(row => row.credential.type === "oauth"));
+			// Prefer providers where pinning is meaningful (≥2 OAuth accounts).
+			const multi = withOAuth.filter(
+				p => storage.listStoredCredentials(p).filter(row => row.credential.type === "oauth").length > 1,
+			);
+			const choices = multi.length > 0 ? multi : withOAuth;
+			if (choices.length === 0) {
+				process.stdout.write("No OAuth accounts stored.\n");
+				return;
+			}
+			provider = choices.length === 1 ? choices[0] : await pickProviderToPin(choices);
+		}
+
+		const accounts = collectOAuthAccounts(storage, [provider]);
+		if (accounts.length === 0) {
+			process.stdout.write(`No OAuth accounts stored for ${provider}.\n`);
+			return;
+		}
+
+		const selection = await pickAccountToPin(provider, accounts);
+		if (selection === "auto") {
+			storage.setPinnedCredential(provider, null);
+			process.stdout.write(`Cleared pin for ${provider}; balancing across ${accounts.length} account(s).\n`);
+			return;
+		}
+		const pinned = accounts.find(account => account.id === selection);
+		if (!pinned || !storage.setPinnedCredential(provider, selection)) {
+			throw new Error(`Failed to pin credential #${selection} for ${provider}`);
+		}
+		process.stdout.write(`Pinned ${provider} to ${pinned.label}.\n`);
+	} finally {
+		store.close();
+	}
+}
+
+async function pickProviderToPin(providers: string[]): Promise<string> {
+	const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+	try {
+		process.stdout.write("Select a provider:\n\n");
+		for (let i = 0; i < providers.length; i++) {
+			process.stdout.write(`  ${i + 1}. ${providers[i]}\n`);
+		}
+		process.stdout.write("\n");
+		const choice = await promptLine(rl, `Enter number (1-${providers.length}): `);
+		const index = Number.parseInt(choice, 10) - 1;
+		if (Number.isNaN(index) || index < 0 || index >= providers.length) {
+			throw new Error(`Invalid selection: ${choice}`);
+		}
+		return providers[index];
+	} finally {
+		rl.close();
+	}
+}
+
+/** Prompt for the account to pin; returns its credential id, or "auto" to clear the pin. */
+async function pickAccountToPin(provider: string, accounts: StoredOAuthAccount[]): Promise<number | "auto"> {
+	const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+	try {
+		process.stdout.write(`Select the account to use for ${provider}:\n\n`);
+		for (let i = 0; i < accounts.length; i++) {
+			const marker = accounts[i].pinned ? " (current)" : "";
+			process.stdout.write(`  ${i + 1}. ${accounts[i].label}${marker}\n`);
+		}
+		const autoOption = accounts.length + 1;
+		process.stdout.write(`  ${autoOption}. Auto (balance across all accounts)\n\n`);
+		const choice = await promptLine(rl, `Enter number (1-${autoOption}): `);
+		const index = Number.parseInt(choice, 10) - 1;
+		if (index === accounts.length) return "auto";
+		if (Number.isNaN(index) || index < 0 || index >= accounts.length) {
+			throw new Error(`Invalid selection: ${choice}`);
+		}
+		return accounts[index].id;
+	} finally {
+		rl.close();
 	}
 }
 
@@ -925,6 +1082,12 @@ export async function runAuthBrokerCommand(cmd: AuthBrokerCommandArgs): Promise<
 			return;
 		case "list":
 			await runList(cmd.flags);
+			return;
+		case "accounts":
+			await runAccounts(cmd.flags);
+			return;
+		case "use":
+			await runUse(cmd.flags);
 			return;
 		default: {
 			// Exhaustive check.

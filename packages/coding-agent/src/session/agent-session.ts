@@ -229,7 +229,7 @@ import {
 	type AsyncResultEntry,
 	buildAsyncResultBatchMessage,
 } from "./async-job-delivery";
-import type { AuthStorage } from "./auth-storage";
+import type { AccountPinScope, AuthStorage } from "./auth-storage";
 import { BashRunner, type BashRunnerHost } from "./bash-runner";
 import {
 	checkpointStartedAtFromEntry,
@@ -7803,13 +7803,29 @@ export class AgentSession {
 	}
 
 	/**
-	 * Pin a stored OAuth account to the current model provider for this session.
-	 * Returns false while streaming or when the credential is no longer available.
+	 * Pin a stored OAuth account to the current model provider.
+	 *
+	 * `scope` selects how long the pin lasts: `session` (default) dies with this
+	 * session, `always` persists across sessions. Returns false while streaming or
+	 * when the credential is no longer available.
 	 */
-	pinCurrentProviderOAuthAccount(credentialId: number): boolean {
+	pinCurrentProviderOAuthAccount(credentialId: number, scope: AccountPinScope = "session"): boolean {
 		const provider = this.model?.provider;
 		if (!provider || this.isStreaming) return false;
-		return this.#modelRegistry.authStorage.pinSessionOAuthAccount(provider, this.sessionId, credentialId);
+		const authStorage = this.#modelRegistry.authStorage;
+		return scope === "always"
+			? authStorage.setPinnedCredential(provider, credentialId)
+			: authStorage.pinSessionOAuthAccount(provider, this.sessionId, credentialId);
+	}
+
+	/** Clear the current provider's OAuth pin at `scope`. */
+	clearCurrentProviderOAuthPin(scope: AccountPinScope = "session"): boolean {
+		const provider = this.model?.provider;
+		if (!provider || this.isStreaming) return false;
+		const authStorage = this.#modelRegistry.authStorage;
+		return scope === "always"
+			? authStorage.setPinnedCredential(provider, null)
+			: authStorage.clearSessionOAuthPin(provider, this.sessionId);
 	}
 
 	/**

@@ -349,6 +349,10 @@
 - Fixed custom `anthropic-messages` OAuth providers being unable to opt into configured Claude Code fingerprint header overrides. ([#5888](https://github.com/can1357/oh-my-pi/issues/5888))
 - Fixed authoritative providers (e.g. `openai-codex`) keeping unsupported bundled models selectable when a fresh model cache and an expired OAuth token coincided: built-in discovery now forces the OAuth refresh so the provider's model manager is constructed and prunes stale bundled entries (e.g. `gpt-5.4-nano`) instead of waiting out the cache TTL. ([#5364](https://github.com/can1357/oh-my-pi/issues/5364))
 
+### Added
+
+- Extended `/session pin` with a pin scope, and added the `omp auth-broker accounts` / `omp auth-broker use` verbs. `/session pin <account>` still binds an account for the current session; `/session pin --always <account>` stores a durable, cross-session pin, and `/session pin [--always] auto` clears it. The account picker gained an "Auto" row plus markers distinguishing a session pin from a durable one. The CLI verbs have no session, so they always read and write the durable pin.
+
 ## [17.0.5] - 2026-07-18
 
 ### Added

@@ -112,6 +112,10 @@
 - Fixed model switches to Devin rejecting foreign provider response IDs, reasoning signatures, and empty interrupted turns as invalid Cascade history.
 - Classified zero-output Devin `invalid_argument` trailers as context overflow when the serialized message history is already large, routing cumulative tool-output payload failures through context maintenance—including artifact-backed shake rescue—instead of retrying the same rejected history.
 
+### Added
+
+- Added durable, cross-session per-provider OAuth account pinning: `AuthStorage.setPinnedCredential` / `getPinnedCredentialId` persist a preferred credential id (new `auth_pinned_accounts` table) that the credential selector honours over hash/round-robin balancing and usage-based ranking. Session credential records now carry an `explicit` flag, so a deliberate `pinSessionOAuthAccount` outranks a durable pin for that one session while incidental stickiness does not — selection and `account_uuid` attribution follow one precedence chain ordered by explicitness, then by narrowness of scope. `clearSessionOAuthPin` / `hasExplicitSessionOAuthPin` manage the session-scoped pin, and `listOAuthAccounts` reports `pinned` and `sessionPinned` separately. The pin is a preference, not a lock — a blocked or removed pinned account still falls through to sibling accounts, so a pinned-but-exhausted account never wedges a request.
+
 ## [17.0.5] - 2026-07-18
 
 ### Changed
